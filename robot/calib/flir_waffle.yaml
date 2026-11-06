@@ -1,0 +1,36 @@
+image_width: 1440
+image_height: 1080
+camera_name: "flir_camera"
+distortion_model: "plumb_bob"
+
+# Distortion Coefficients (D)
+# Format: [k1, k2, p1, p2, k3]
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [-0.38377166, 0.16945133, -0.00649096, 0.00158358, -0.03675785]
+
+# Intrinsic Camera Matrix (K)
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [854.10069912, 0.00000000, 714.69995331,
+         0.00000000, 856.85005887, 540.85670372,
+         0.00000000, 0.00000000, 1.00000000]
+
+# Rectification Matrix (R)
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1.0, 0.0, 0.0,
+         0.0, 1.0, 0.0,
+         0.0, 0.0, 1.0]
+
+# Projection Matrix (P)
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [854.10069912, 0.0, 714.69995331, 0.0,
+         0.0, 856.85005887, 540.85670372, 0.0,
+         0.0, 0.0, 1.0, 0.0]
+

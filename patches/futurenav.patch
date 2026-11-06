@@ -1,0 +1,1063 @@
+diff --git a/eval/agent.py b/eval/agent.py
+index 2fce7d9..0a339f1 100644
+--- a/eval/agent.py
++++ b/eval/agent.py
+@@ -23,6 +23,14 @@ from qwen_vl.model.modeling_qwen3_vl_obshead import Qwen3VLForFutureNav
+ min_pixels = 28 * 28
+ max_pixels = 1605632
+ 
++# Optional deployment knobs. Both default to the values used for the reported
++# results, so unset behaviour is unchanged.
++#   FUTURENAV_ATTN          "eager" (default) | "sdpa" | "flash_attention_2"
++#   FUTURENAV_VGGT_RECENT   VGGT KV-cache recent_size; default 48 (8 + 48 frames).
++#                           Each frame costs ~159 MB, so 48 -> 24 saves ~3.8 GB.
++ATTN_IMPL = os.environ.get("FUTURENAV_ATTN", "eager")
++VGGT_RECENT = os.environ.get("FUTURENAV_VGGT_RECENT")
++
+ ACTION_NAME_TO_ENV = {"STOP": 0, "MOVE_FORWARD": 1, "TURN_LEFT": 2, "TURN_RIGHT": 3}
+ 
+ 
+@@ -63,10 +71,17 @@ class FutureNav_R2R_Agent(Agent):
+             config=config,
+             torch_dtype=torch.bfloat16,
+             device_map={"": self.device},
+-            attn_implementation="eager",
++            attn_implementation=ATTN_IMPL,
+             mode='evaluation'
+         ).eval()
+ 
++        if VGGT_RECENT is not None:
++            recent = int(VGGT_RECENT)
++            self.model.kv_cache_vggt.recent_size = recent
++            self.model.kv_cache_vggt.cache_size = self.model.kv_cache_vggt.start_size + recent
++            print(f"  vggt kv-cache: {self.model.kv_cache_vggt.start_size}+{recent} frames")
++        print(f"  attn_implementation: {ATTN_IMPL}")
++
+         self.tokenizer = AutoTokenizer.from_pretrained(checkpoint_path, padding_side="left")
+         self.processor = AutoProcessor.from_pretrained(
+             checkpoint_path, max_pixels=max_pixels, min_pixels=min_pixels, padding_side="left"
+diff --git a/eval/run.py b/eval/run.py
+index 3cfb9f9..f1edd01 100644
+--- a/eval/run.py
++++ b/eval/run.py
+@@ -10,7 +10,11 @@ sys.path.insert(0, PROJECT_DIR)
+ os.chdir(PROJECT_DIR)
+ 
+ import argparse
++import base64
++import hashlib
+ import json
++import math
++import shutil
+ import time
+ 
+ import numpy as np
+@@ -19,28 +23,204 @@ from habitat.datasets import make_dataset
+ from tqdm import trange
+ from VLN_CE.vlnce_baselines.config.default import get_config
+ 
+-from agent import FutureNav_R2R_Agent
+-
+ 
+ def main():
+     parser = argparse.ArgumentParser(description="FutureNav R2R VLN-CE Evaluation")
+     parser.add_argument("--exp-config", type=str, required=True, help="Habitat experiment config yaml")
+     parser.add_argument("--split-num", type=int, required=True, help="Number of parallel splits")
+     parser.add_argument("--split-id", type=int, required=True, help="This split's ID")
+-    parser.add_argument("--model-path", type=str, required=True, help="Model checkpoint directory")
++    parser.add_argument("--model-path", type=str, default=None, help="Model checkpoint directory (in-process mode)")
++    parser.add_argument("--server", type=str, default=None,
++                        help="URL of a running deploy/server.py. Required when habitat and the "
++                             "model live in different environments (habitat-sim 0.1.7 is capped "
++                             "at Python 3.8; Qwen3-VL needs >= 3.9).")
+     parser.add_argument("--result-path", type=str, required=True, help="Directory to save results")
+-    parser.add_argument("--exp-save", type=str, default="data", help="'video-data' to save maps")
++    parser.add_argument("--exp-save", type=str, default="data",
++                        help="comma list: 'data' per-episode stats, 'trace' per-step pose/action/DTG "
++                             "log, 'frames' the RGB frame the model saw at each step, 'video' maps")
++    parser.add_argument("--episode-ids", type=str, default=None,
++                        help="comma-separated episode ids, or a file with one id per line. Applied "
++                             "after --max-episodes sampling; the eval is deterministic, so this "
++                             "replays exactly the trajectories of the full run.")
++    parser.add_argument("--instruction-override", type=str, default=None,
++                        help="JSON {episode_id: {\"text\": str}} to replace an episode's instruction, or "
++                             "{episode_id: {\"schedule\": [{\"text\": str, \"until\": [x, y, z] | null}, ...]}} "
++                             "to swap the text as the agent reaches each waypoint (within 1.0 m horizontally, "
++                             "same floor, after >= 1.0 m of travel since the last swap). Episodes not "
++                             "listed keep their own text.")
++    parser.add_argument("--dump-hidden", action="store_true",
++                        help="save the model's final-layer hidden state at each step to "
++                             "<result-path>/hidden/<episode_id>.npy (float16, one row per "
++                             "step). Feeds the E1.3 / E2.2 probes. Remote mode only.")
++    parser.add_argument("--probe-spec", type=str, default=None,
++                        help="JSON spec of per-step probe arms (experiments/e1_1/spec.json). "
++                             "At each step the server re-queries the model with alternative "
++                             "history selections, reusing the geometry features the real step "
++                             "computed so the VGGT cache still advances exactly one frame. The "
++                             "client sends arm names; the server owns the frames. Remote only.")
++    parser.add_argument("--pointer-probe", action="store_true",
++                        help="E2.3 stage 1: at each step, re-query the model on the frozen step "
++                             "with the instruction cut to where the agent actually is (FGR2R "
++                             "pointer, experiments/e2_3/pointer.py), one sub-instruction behind, "
++                             "one ahead, and with its sub-instructions shuffled. The executed "
++                             "action is untouched. Remote only.")
++    parser.add_argument("--pointer-schedule", type=int, default=None, metavar="SHIFT",
++                        help="E2.3 stage 2: EXECUTE with the instruction cut to sub-instruction "
++                             "(pointer + SHIFT) onward. 0 = the correct place, -1 = one behind, "
++                             "+1 = one ahead.")
++    parser.add_argument("--capture-dir", type=str, default=None,
++                        help="experiments/capture500: record the model's internals at every step "
++                             "(deploy/capture.py) and write <dir>/<episode_id>.npz. Remote only.")
++    parser.add_argument("--capture-validate-every", type=int, default=25,
++                        help="with --capture-dir, rebuild each layer's attention output from the "
++                             "captured weights every N steps as a correctness check (0 = never)")
++    parser.add_argument("--dataset-split", type=str, default=None,
++                        help="override the config's dataset split, e.g. train for the motion-head "
++                             "holdout buildings (experiments/data_engine/split.json)")
++    parser.add_argument("--derail-spec", type=str, default=None,
++                        help="experiments/failure_detection/x4_derail: JSON {arm, mode, episodes: {id: {t0, script}}}. From "
++                             "step t0 the script's actions are executed instead of the model's. mode "
++                             "'walked': the model still sees every frame (its own choice is logged as "
++                             "'action'); 'silent': the model is not called during the script, so the "
++                             "detour never enters its history or VGGT cache; 'wipe': walked, then the "
++                             "server's episode state is reset at release. Episodes not listed run normally.")
++    parser.add_argument("--steer-spec", type=str, default=None,
++                        help="experiments/steer_plan: JSON {arm, layer, mode none|add|set, decode, "
++                             "stop_on_divergence, vectors, probes, episodes: {id: {s0, s1, stop_at, "
++                             "side, orig_executed}}}. Adds (or sets) a residual vector at that layer on "
++                             "steps s0..s1-1 and records the probe readout every step. Needs --server.")
++    parser.add_argument("--capture-profile", choices=("full", "lite"), default="full",
++                        help="full = everything in deploy/capture.py (~606 KB/step); lite = last-token "
++                             "state at layers 22 and 37 plus all logits (~10 KB/step)")
++    parser.add_argument("--capture-min-free-gb", type=float, default=30.0,
++                        help="with --capture-dir, stop cleanly before an episode if the disk has "
++                             "less than this free (the disk is shared)")
+     parser.add_argument("--num-history", type=int, default=8, help="Max history frames")
+     parser.add_argument("--max-steps", type=int, default=400, help="Max steps per episode")
+     parser.add_argument("--max-episodes", type=int, default=0, help="Max episodes to eval (0=all)")
+     parser.add_argument("--gpu-id", type=int, default=0, help="GPU device ID for rendering")
++    parser.add_argument("--ackermann-radius", type=float, default=None,
++                        help="Simulate a car: TURN_LEFT/TURN_RIGHT drive an arc of this "
++                             "radius in metres instead of pivoting in place. 0.65 = the "
++                             "JetRacer's measured full-lock radius, which makes each 15 deg "
++                             "turn also translate 0.168 m forward and 0.022 m sideways.")
++    parser.add_argument("--ackermann-substeps", type=int, default=5,
++                        help="Arc discretisation. Higher tracks the curve more exactly; the "
++                             "navmesh filter tests straight chords between substeps.")
++    parser.add_argument("--waypoint-exec", action="store_true",
++                        help="Execute the server's per-step pose increment ('motion': dx, dy metres, "
++                             "dyaw degrees, + = left) through MOVE_FORWARD instead of the discrete "
++                             "primitive (eval/waypoint_exec.py). Steps without a motion are unchanged.")
++    parser.add_argument("--s1", action="store_true",
++                        help="Dual system: eval/s1_local.py drives (LiDAR local planner on the server's pose plan) "
++                             "and asks the server for a plan only on its triggers. Needs --waypoint-exec and "
++                             "deploy/head_eval_server.py --exec plan.")
++    parser.add_argument("--s1-config", default=None, help="JSON kwargs for s1_local.LocalPlanner")
++    parser.add_argument("--cam-pitch", type=float, default=None,
++                        help="Override RGB_SENSOR pitch in degrees, POSITIVE = nose UP "
++                             "(training default 0 = level). Measured over 12 episode start "
++                             "poses, +20 deg at 0.12 m cuts the floor's share of the frame "
++                             "from 46%% to 16%% and restores distant-structure coverage to "
++                             "the 1.25 m baseline -- recovering a 0.5 m camera's composition "
++                             "without a mast. But the model only ever saw level cameras, so "
++                             "this trades one distribution shift for another.")
++    parser.add_argument("--cam-height", type=float, default=None,
++                        help="Override RGB_SENSOR height in metres (training default 1.25). "
++                             "A JetRacer sits at ~0.12 m bare, ~0.5-0.7 m on a mast. Only the "
++                             "sensor moves; AGENT_0 geometry and the navmesh are untouched, so "
++                             "the measured drop is attributable to viewpoint alone.")
+     args = parser.parse_args()
++    if not args.server and not args.model_path:
++        parser.error("give --model-path (in-process) or --server (remote inference)")
++    if args.server and args.split_num != 1:
++        parser.error("remote inference serves one episode at a time; use --split-num 1")
++    if args.capture_dir and not args.server:
++        parser.error("--capture-dir requires --server (the state lives on the model side)")
++    if args.capture_dir:
++        os.makedirs(args.capture_dir, exist_ok=True)
++    if args.dump_hidden and not args.server:
++        parser.error("--dump-hidden requires --server (the state lives on the model side)")
++    if args.probe_spec:
++        if not args.server:
++            parser.error("--probe-spec requires --server (probes run server-side)")
++        if args.instruction_override:
++            parser.error("--probe-spec and --instruction-override both rewrite the "
++                         "instruction; together they make the pos_instr arm uninterpretable")
++    if args.pointer_probe:
++        if not args.server:
++            parser.error("--pointer-probe requires --server (probes run server-side)")
++        if args.probe_spec or args.instruction_override or args.pointer_schedule is not None:
++            parser.error("--pointer-probe must run alone: the other options rewrite the "
++                         "instruction the probe arms are compared against")
++    if args.steer_spec and not args.server:
++        parser.error("--steer-spec requires --server (the hook lives on the model side)")
++    if args.pointer_schedule is not None and args.instruction_override:
++        parser.error("--pointer-schedule and --instruction-override both rewrite the instruction")
+ 
+     config = get_config(args.exp_config)
+     # Override GPU device ID for Habitat-sim rendering
+     config.defrost()
+     config.TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.GPU_DEVICE_ID = args.gpu_id
++    if args.dataset_split:
++        config.TASK_CONFIG.DATASET.SPLIT = args.dataset_split
++    if args.ackermann_radius is not None:
++        # Importing the module is what registers the move_fns and the
++        # "ackermann" action space configuration with the two registries.
++        import ackermann  # noqa: F401
++        config.TASK_CONFIG.SIMULATOR.ACTION_SPACE_CONFIG = "ackermann"
++        config.TASK_CONFIG.SIMULATOR.TURN_RADIUS = args.ackermann_radius
++        config.TASK_CONFIG.SIMULATOR.TURN_SUBSTEPS = args.ackermann_substeps
++        print(f"[ackermann] ACTION_SPACE_CONFIG -> ackermann, R={args.ackermann_radius} m")
++        # SHORTEST_PATH_SENSOR constructs a GreedyGeodesicFollower, which asserts
++        # that action specs named exactly "turn_left"/"turn_right" exist. Under
++        # Ackermann they are "arc_turn_left"/"arc_turn_right", so it raises:
++        #     AssertionError: Could not find an action spec corresponding to turn_left
++        #
++        # Dropping it is correct rather than merely expedient. The follower plans
++        # with turn-in-place primitives, so under Ackermann it would emit action
++        # sequences the vehicle physically cannot execute -- an oracle that lies.
++        # It is also unused here: the policy reads only rgb and instruction
++        # (eval/agent_remote.py), the measures compute geodesic distance straight
++        # from the simulator, and the sensor has no side effects on agent state.
++        # So removing it changes nothing the model or the metrics observe.
++        sensors = [s for s in config.TASK_CONFIG.TASK.SENSORS if s != "SHORTEST_PATH_SENSOR"]
++        if len(sensors) != len(config.TASK_CONFIG.TASK.SENSORS):
++            config.TASK_CONFIG.TASK.SENSORS = sensors
++            print("[ackermann] dropped SHORTEST_PATH_SENSOR (its greedy follower "
++                  "requires pivot primitives; unused by the policy and the measures)")
++    if args.s1 and not args.waypoint_exec:
++        parser.error("--s1 executes its commands through --waypoint-exec")
++    if args.waypoint_exec:
++        if args.ackermann_radius is not None:
++            parser.error("--waypoint-exec and --ackermann-radius both change how motion is executed")
++        if not args.server:
++            parser.error("--waypoint-exec requires --server (the motion comes from the server)")
++        import waypoint_exec  # noqa: F401  (registers the pose-aware move_forward)
++        if abs(config.TASK_CONFIG.SIMULATOR.FORWARD_STEP_SIZE - waypoint_exec.FORWARD) > 1e-6:
++            parser.error("waypoint_exec.clear() restores a %.2f m step but the config uses %.2f m"
++                         % (waypoint_exec.FORWARD, config.TASK_CONFIG.SIMULATOR.FORWARD_STEP_SIZE))
++        print("[waypoint-exec] MOVE_FORWARD executes the server's pose increment when one is sent")
++    if args.cam_height is not None:
++        pos = list(config.TASK_CONFIG.SIMULATOR.RGB_SENSOR.POSITION)
++        old = pos[1]
++        pos[1] = args.cam_height
++        config.TASK_CONFIG.SIMULATOR.RGB_SENSOR.POSITION = pos
++        print(f"[cam-height] RGB_SENSOR y: {old} -> {args.cam_height} m")
++    if args.cam_pitch is not None:
++        # Habitat ORIENTATION is Euler [pitch, yaw, roll] in RADIANS about the
++        # sensor axes. Positive rotation about x tilts the optical axis UP, so a
++        # nose-up tilt is a positive value -- the opposite of the mount-pitch
++        # convention in deploy/camera_adapter.py, where positive means nose DOWN.
++        orient = list(config.TASK_CONFIG.SIMULATOR.RGB_SENSOR.ORIENTATION)
++        old_p = orient[0]
++        orient[0] = math.radians(args.cam_pitch)
++        config.TASK_CONFIG.SIMULATOR.RGB_SENSOR.ORIENTATION = orient
++        print(f"[cam-pitch] RGB_SENSOR pitch: {math.degrees(old_p):.1f} -> "
++              f"{args.cam_pitch:+.1f} deg (positive = nose up)")
+     config.freeze()
++    print(f"[config] RGB_SENSOR POSITION={list(config.TASK_CONFIG.SIMULATOR.RGB_SENSOR.POSITION)} "
++          f"HFOV={config.TASK_CONFIG.SIMULATOR.RGB_SENSOR.HFOV} "
++          f"ALLOW_SLIDING={config.TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING}")
+     dataset = make_dataset(id_dataset=config.TASK_CONFIG.DATASET.TYPE, config=config.TASK_CONFIG.DATASET)
+     dataset.episodes.sort(key=lambda ep: ep.episode_id)
+     np.random.seed(42)
+@@ -53,12 +233,28 @@ def main():
+         dataset.episodes = [dataset.episodes[i] for i in indices]
+         print(f"Randomly selected {len(dataset.episodes)}/{total} episodes for evaluation")
+ 
++    if args.episode_ids:
++        src = args.episode_ids
++        raw = open(src).read().split() if os.path.isfile(src) else src.split(",")
++        wanted = {s.strip() for s in raw if s.strip()}
++        dataset.episodes = [ep for ep in dataset.episodes if str(ep.episode_id) in wanted]
++        missing = wanted - {str(ep.episode_id) for ep in dataset.episodes}
++        print(f"--episode-ids: kept {len(dataset.episodes)} episodes"
++              + (f", {len(missing)} not in the sampled set: {sorted(missing)[:10]}" if missing else ""))
++
+     dataset_split = dataset.get_splits(args.split_num)[args.split_id]
+     evaluate(config, args.split_id, dataset_split, args)
+ 
+ 
+ def evaluate(config, split_id, dataset, args):
+     print(f"[chunk{split_id}] GPU_DEVICE_ID={config.TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.GPU_DEVICE_ID}, --gpu-id={args.gpu_id}")
++    if args.waypoint_exec:
++        import waypoint_exec  # already registered in main(); bound here for set_motion/clear
++    s1 = None
++    if args.s1:
++        from s1_local import LocalPlanner
++        s1 = LocalPlanner(**json.loads(args.s1_config or "{}"))
++        print(f"[s1] LiDAR local planner, config {args.s1_config or '{}'}")
+ 
+     # Detect already completed episodes (before creating env to avoid abort on close)
+     log_dir = os.path.join(args.result_path, "log")
+@@ -83,13 +279,119 @@ def evaluate(config, split_id, dataset, args):
+     env = Env(config.TASK_CONFIG, dataset)
+     require_map = "video" in (args.exp_save or "")
+ 
+-    agent = FutureNav_R2R_Agent(
+-        checkpoint_path=args.model_path,
+-        result_path=args.result_path,
+-        require_map=require_map,
+-        max_history_frames=args.num_history,
+-        device=f"cuda:{args.gpu_id}",
+-    )
++    probe_spec = None
++    if args.probe_spec:
++        with open(args.probe_spec) as f:
++            probe_spec = json.load(f)
++        probe_spec["instruction_swap"] = {str(k): v for k, v
++                                          in probe_spec.get("instruction_swap", {}).items()}
++        print(f"Probe spec: {args.probe_spec} "
++              f"({len(probe_spec['arms'])} arms, {len(probe_spec['instruction_swap'])} episodes)")
++
++    pointer_align = None
++    if args.pointer_probe or args.pointer_schedule is not None:
++        sys.path.insert(0, os.path.join(PROJECT_DIR, "experiments", "e2_3"))
++        import pointer as instr_pointer
++        pointer_align = instr_pointer.load()
++        print(f"E2.3 pointer: {len(pointer_align)} aligned episodes"
++              + (" | probing remaining/behind/ahead/shuffle" if args.pointer_probe else "")
++              + (f" | executing with shift {args.pointer_schedule:+d}"
++                 if args.pointer_schedule is not None else ""))
++    if args.pointer_probe:
++        probe_spec = {"experiment": "e2.3", "pointer": True, "min_step": 9,
++                      "control_repeat_every": 10, "instruction_swap": {},
++                      "arms": [{"name": n, "history": "control"} for n in
++                               ("remaining", "behind", "ahead", "shuffle", "control_repeat")]}
++
++    if args.server:
++        from agent_remote import FutureNavRemoteAgent
++        agent = FutureNavRemoteAgent(server=args.server, result_path=args.result_path,
++                                     probe_spec=probe_spec, want_hidden=args.dump_hidden,
++                                     capture=bool(args.capture_dir),
++                                     capture_validate_every=args.capture_validate_every,
++                                     capture_profile=args.capture_profile)
++        # Snapshot everything that defines this run, including the server-side
++        # settings, next to the results. Ablations are only comparable if both
++        # runs used the same model config, and "which cache size produced these
++        # numbers?" is not answerable after the fact otherwise.
++        try:
++            import urllib.request
++            with urllib.request.urlopen(args.server + "/health", timeout=10) as resp:
++                server_cfg = json.loads(resp.read().decode())
++        except Exception as exc:
++            server_cfg = {"error": str(exc)}
++        with open(os.path.join(args.result_path, "run_config.json"), "w") as f:
++            json.dump({
++                "cam_height": config.TASK_CONFIG.SIMULATOR.RGB_SENSOR.POSITION[1],
++                "sensor_position": list(config.TASK_CONFIG.SIMULATOR.RGB_SENSOR.POSITION),
++                "sensor_orientation": list(config.TASK_CONFIG.SIMULATOR.RGB_SENSOR.ORIENTATION),
++                "hfov": config.TASK_CONFIG.SIMULATOR.RGB_SENSOR.HFOV,
++                "agent_height": config.TASK_CONFIG.SIMULATOR.AGENT_0.HEIGHT,
++                "agent_radius": config.TASK_CONFIG.SIMULATOR.AGENT_0.RADIUS,
++                "allow_sliding": config.TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING,
++                "action_space_config": config.TASK_CONFIG.SIMULATOR.ACTION_SPACE_CONFIG,
++                "ackermann_radius": args.ackermann_radius,
++                "ackermann_substeps": args.ackermann_substeps,
++                "task_sensors": list(config.TASK_CONFIG.TASK.SENSORS),
++                "forward_step_size": config.TASK_CONFIG.SIMULATOR.FORWARD_STEP_SIZE,
++                "turn_angle": config.TASK_CONFIG.SIMULATOR.TURN_ANGLE,
++                "split": config.TASK_CONFIG.DATASET.SPLIT,
++                "max_episodes": args.max_episodes,
++                "num_history": args.num_history,
++                "max_steps": args.max_steps,
++                "server": server_cfg,
++                "dump_hidden": args.dump_hidden,
++                "capture_dir": os.path.abspath(args.capture_dir) if args.capture_dir else None,
++                "capture_validate_every": args.capture_validate_every if args.capture_dir else None,
++                "probe_spec_path": args.probe_spec,
++                "probe_arms": (probe_spec or {}).get("arms"),
++                "probe_min_step": (probe_spec or {}).get("min_step"),
++                "probe_control_repeat_every": (probe_spec or {}).get("control_repeat_every"),
++                "pointer_probe": bool(args.pointer_probe),
++                "pointer_schedule": args.pointer_schedule,
++                "derail_spec": os.path.abspath(args.derail_spec) if args.derail_spec else None,
++                "capture_profile": args.capture_profile if args.capture_dir else None,
++                "steer_spec": os.path.abspath(args.steer_spec) if args.steer_spec else None,
++            }, f, indent=2)
++    else:
++        from agent import FutureNav_R2R_Agent
++        agent = FutureNav_R2R_Agent(
++            checkpoint_path=args.model_path,
++            result_path=args.result_path,
++            require_map=require_map,
++            max_history_frames=args.num_history,
++            device=f"cuda:{args.gpu_id}",
++        )
++
++    derail_spec = None
++    if args.derail_spec:
++        with open(args.derail_spec) as f:
++            derail_spec = json.load(f)
++        if derail_spec["mode"] not in ("walked", "silent", "wipe"):
++            raise ValueError("derail mode must be walked, silent or wipe")
++        derail_spec["episodes"] = {str(k): v for k, v in derail_spec["episodes"].items()}
++        print(f"--derail-spec: arm {derail_spec['arm']!r}, mode {derail_spec['mode']}, "
++              f"{len(derail_spec['episodes'])} episodes")
++
++    # experiments/steer_plan: vectors[id] is (s1 - s0, hidden) float32, one row per
++    # steered step; probes hold the bend-side readout folded to h @ w + c.
++    steer_spec = steer_vecs = steer_probes = None
++    if args.steer_spec:
++        with open(args.steer_spec) as f:
++            steer_spec = json.load(f)
++        if steer_spec["mode"] not in ("none", "add", "set"):
++            raise ValueError("steer mode must be none, add or set")
++        steer_spec["episodes"] = {str(k): v for k, v in steer_spec["episodes"].items()}
++        steer_vecs = np.load(steer_spec["vectors"]) if steer_spec["mode"] != "none" else None
++        steer_probes = np.load(steer_spec["probes"])
++        print(f"--steer-spec: arm {steer_spec['arm']!r}, layer {steer_spec['layer']}, "
++              f"mode {steer_spec['mode']}, {len(steer_spec['episodes'])} episodes")
++
++    overrides = {}
++    if args.instruction_override:
++        with open(args.instruction_override) as f:
++            overrides = {str(k): v for k, v in json.load(f).items()}
++        print(f"--instruction-override: {len(overrides)} episodes get replacement instructions")
+ 
+     num_episodes = len(env.episodes)
+     EARLY_STOP_ROTATION = config.EVAL.get("EARLY_STOP_ROTATION", 25)
+@@ -115,12 +417,68 @@ def evaluate(config, split_id, dataset, args):
+             obs = env.step({"action": 0})
+             continue
+ 
++        if args.capture_dir:
++            free_gb = shutil.disk_usage(os.path.abspath(args.capture_dir)).free / 1e9
++            if free_gb < args.capture_min_free_gb:
++                print(f"[capture] STOPPING: {free_gb:.1f} GB free < {args.capture_min_free_gb} GB. "
++                      f"Free space and re-run the same command; finished episodes are kept.")
++                break
+         ep_start = time.time()
++        # Resolve this episode's probe arms (the pos_instr donor) before reset.
++        # hasattr keeps the in-process agent in eval/agent.py untouched.
++        if hasattr(agent, "set_episode"):
++            agent.set_episode(current_ep_id)
+         agent.reset()
++        if s1 is not None:
++            s1.reset()
++        s1_reason, s1_motion, scan_pts = None, None, np.zeros((0, 2))
+         iter_step = 0
+         continuous_rotation_count = 0
+         last_dtg = 999
+ 
++        override = overrides.get(current_ep_id)
++        schedule = None
++        if override is not None:
++            schedule = override["schedule"] if "schedule" in override else [{"text": override["text"], "until": None}]
++        stage, travelled, last_here = 0, 0.0, None
++
++        # E2.3 pointer: which sub-instruction the agent is on, from its position.
++        ptr = None
++        if pointer_align is not None and current_ep_id in pointer_align:
++            ptr = instr_pointer.Episode(pointer_align[current_ep_id],
++                                        env.current_episode.reference_path)
++            if ptr.instruction != env.current_episode.instruction.instruction_text:
++                raise RuntimeError("E2.3 alignment text differs from the episode's for %s"
++                                   % current_ep_id)
++            shuffle_seed = int(hashlib.sha256(("e2.3:" + current_ep_id).encode()).hexdigest()[:8], 16)
++
++        derail = derail_spec["episodes"].get(current_ep_id) if derail_spec else None
++        derail_log = None
++        if derail is not None:
++            derail_log = {"arm": derail_spec["arm"], "mode": derail_spec["mode"],
++                          "t0": int(derail["t0"]), "script": list(derail["script"]),
++                          "release_step": int(derail["t0"]) + len(derail["script"]), "wiped_at": None}
++
++        steer_ep = steer_spec["episodes"].get(current_ep_id) if steer_spec else None
++        steer_log = None
++        if steer_ep is not None:
++            steer_log = {k: steer_spec.get(k) for k in ("arm", "layer", "mode", "decode",
++                                                        "stop_on_divergence")}
++            steer_log.update({k: steer_ep.get(k) for k in ("s0", "s1", "stop_at", "side")})
++            steer_log["diverged_at"] = None
++            sp = {k: steer_probes["%s_%s" % (current_ep_id, k)] for k in ("w22", "c22", "w37", "c37")}
++        agent.step_steer = None
++
++        tracing = "trace" in args.exp_save
++        trace_steps, stop_by = [], "env_limit"
++        hidden_rows = []
++        if tracing:
++            trace_dir = os.path.join(args.result_path, "trace")
++            frame_dir = os.path.join(trace_dir, "frames", current_ep_id)
++            os.makedirs(trace_dir, exist_ok=True)
++            if "frames" in args.exp_save:
++                os.makedirs(frame_dir, exist_ok=True)
++
+         while not env.episode_over:
+             info = env.get_metrics()
+ 
+@@ -130,21 +488,211 @@ def evaluate(config, split_id, dataset, args):
+             else:
+                 continuous_rotation_count += 1
+ 
++            if schedule is not None:
++                here = np.array(env.sim.get_agent_state().position, dtype=float)
++                if last_here is not None:
++                    travelled += float(np.linalg.norm((here - last_here)[[0, 2]]))
++                last_here = here
++                wp = schedule[stage]["until"]
++                # Several step-end waypoints sit within ~1 m of the start, so proximity alone
++                # would drop steps before the agent has moved. Require real travel since the
++                # previous switch, and advance at most one stage per step.
++                if (wp is not None and stage < len(schedule) - 1 and travelled >= 1.0
++                        and math.hypot(here[0] - wp[0], here[2] - wp[2]) <= 1.0 and abs(here[1] - wp[1]) < 1.0):
++                    stage += 1
++                    travelled = 0.0
++                obs["instruction"]["text"] = schedule[stage]["text"]
++
++            if ptr is not None:
++                ptr_k = ptr.update(list(env.sim.get_agent_state().position))
++                if args.pointer_schedule is not None:
++                    obs["instruction"]["text"] = ptr.prompt_from(
++                        min(max(ptr_k + args.pointer_schedule, 0), ptr.K - 1))
++                if args.pointer_probe:
++                    # An arm whose text equals the control prompt is not sent: the
++                    # model is deterministic (control_repeat verifies it), so it
++                    # would agree by construction and only dilute the endpoint.
++                    arms = []
++                    if ptr.K >= 2:
++                        for name, j in (("remaining", ptr_k), ("behind", ptr_k - 1),
++                                        ("ahead", ptr_k + 1)):
++                            if 1 <= j <= ptr.K - 1:
++                                arms.append({"name": name, "history": "control",
++                                             "instruction": ptr.prompt_from(j), "ptr_j": j})
++                        arms.append({"name": "shuffle", "history": "control",
++                                     "instruction": ptr.shuffled(shuffle_seed)})
++                        arms.append({"name": "control_repeat", "history": "control"})
++                    agent.step_arms = arms
++
++            # experiments/failure_detection/x4_derail: is this step inside the scripted detour?
++            k_script = None
++            if derail is not None:
++                k_rel = iter_step - derail_log["t0"]
++                if 0 <= k_rel < len(derail_log["script"]):
++                    k_script = k_rel
++                    # selfdiag T0: scripted steps (e.g. a 24-turn look-around) don't count toward the
++                    # harness's no-progress stop; the count restarts at release
++                    continuous_rotation_count = 0
++                if (derail_log["mode"] == "wipe" and k_rel == len(derail_log["script"])
++                        and derail_log["wiped_at"] is None):
++                    # Release: keep what was captured before the wipe, then clear the
++                    # server's history and VGGT cache by starting a fresh session.
++                    if args.capture_dir:
++                        agent.flush_capture(f"{current_ep_id}__prewipe", os.path.abspath(args.capture_dir))
++                    counts = dict(agent.action_counts)
++                    agent.reset()
++                    agent.action_counts = counts
++                    derail_log["wiped_at"] = iter_step
++
++            # experiments/steer_plan: every step records the layer state; s0..s1-1 also steer,
++            # unless the run has left the original trajectory and the arm stops there.
++            steer_vec = None
++            if steer_ep is not None:
++                req = {"layer": int(steer_spec["layer"]), "mode": "none", "final": True}
++                if (steer_spec["mode"] != "none" and steer_ep["s0"] <= iter_step < steer_ep["s1"]
++                        and steer_log["diverged_at"] is None):
++                    row = np.ascontiguousarray(
++                        steer_vecs[current_ep_id][iter_step - steer_ep["s0"]], dtype=np.float32)
++                    req.update(mode=steer_spec["mode"], decode=bool(steer_spec.get("decode", True)),
++                               positions=steer_spec.get("positions", "last"))
++                    if row.ndim == 2:
++                        # one vector per depth in steer_spec["layers"]; the readout
++                        # layer's own vector (if any) is what s22_post adds
++                        req["multi"] = [{"layer": int(l), "vec": base64.b64encode(
++                            np.ascontiguousarray(v).tobytes()).decode()}
++                            for l, v in zip(steer_spec["layers"], row)]
++                        L = [int(l) for l in steer_spec["layers"]]
++                        steer_vec = row[L.index(int(steer_spec["layer"]))] if int(
++                            steer_spec["layer"]) in L else np.zeros(row.shape[1], np.float32)
++                    else:
++                        steer_vec = row
++                        req["vec"] = base64.b64encode(row.tobytes()).decode()
++                agent.step_steer = req
++
+             # Time model inference
+             t0 = time.time()
+-            action = agent.act(obs, info, env.current_episode.episode_id)
++            if k_script is not None and derail_log["mode"] == "silent":
++                action = {"action": -1}                   # the model never sees this frame
++            else:
++                if args.server:
++                    st_pose = env.sim.get_agent_state()
++                    agent.step_pose = [float(v) for v in st_pose.position] + [
++                        2 * math.atan2(st_pose.rotation.y, st_pose.rotation.w)]
++                if s1 is not None:
++                    # System 1 decides whether System 2 is asked this step (the server still sees every frame)
++                    agent.step_query = s1.need_query(agent.step_pose)
++                    s1_reason = s1.reason if agent.step_query else None
++                action = agent.act(obs, info, env.current_episode.episode_id)
++                if s1 is not None:
++                    if action.get("plan") is not None:
++                        s1.set_plan(action["plan"], agent.step_pose)
++                    scan_pts = s1.scan(env.sim, agent.step_pose)
++                    kind, s1_motion = s1.control(agent.step_pose, scan_pts)
++                    action = {"action": 0} if kind == "stop" else {"action": 1, "motion": dict(
++                        zip(("dx", "dy", "dyaw"), s1_motion))}
+             t1 = time.time()
+             infer_elapsed = t1 - t0
+             total_infer_time += infer_elapsed
++            model_action = action["action"]
++            obs_before = obs
++            obs_text_shown = obs["instruction"]["text"]
+ 
+             # Early stop if stuck rotating or too many steps
+-            if continuous_rotation_count > EARLY_STOP_ROTATION or iter_step > EARLY_STOP_STEPS:
++            if k_script is not None:
++                action = {"action": ("STOP", "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT").index(
++                    derail_log["script"][k_script])}
++            elif (steer_ep is not None and steer_ep.get("stop_at") is not None
++                  and iter_step >= steer_ep["stop_at"]):
++                action = {"action": 0}
++                stop_by = "steer_cap"
++            elif continuous_rotation_count > EARLY_STOP_ROTATION:
+                 action = {"action": 0}
++                stop_by = "harness_stuck"
++            elif iter_step > EARLY_STOP_STEPS:
++                action = {"action": 0}
++                stop_by = "harness_step_cap"
++            elif model_action == 0:
++                stop_by = "model"
++
++            if tracing:
++                st = env.sim.get_agent_state()
++                pos_before = np.array(st.position, dtype=float)
++                q = st.rotation
++                if "frames" in args.exp_save:
++                    from PIL import Image
++                    Image.fromarray(obs["rgb"]).convert("RGB").save(
++                        os.path.join(frame_dir, f"{iter_step:03d}.jpg"), quality=85)
++
++            steer_rec = None
++            if steer_ep is not None:
++                sr = agent.last_steer
++                h22 = np.frombuffer(base64.b64decode(sr["pre"]), dtype=np.float16).astype(np.float32)
++                s22 = float(h22 @ sp["w22"] + sp["c22"])
++                post = s22
++                if steer_vec is not None:
++                    post = float(((h22 + steer_vec) if steer_spec["mode"] == "add" else steer_vec)
++                                 @ sp["w22"] + sp["c22"])
++                steer_rec = {"mode": sr["mode"], "s22": round(s22, 4), "s22_post": round(post, 4),
++                             "s37": round(float(agent.last_final.astype(np.float32) @ sp["w37"]
++                                                + sp["c37"]), 4),
++                             "norm_delta": sr["norm_delta"], "norm_pre": sr["norm_pre"]}
++                orig = steer_ep.get("orig_executed") or []
++                if (steer_spec.get("stop_on_divergence") and steer_log["diverged_at"] is None
++                        and iter_step < len(orig)
++                        and ("STOP", "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT")[action["action"]]
++                        != orig[iter_step]):
++                    steer_log["diverged_at"] = iter_step
+ 
+             # Time habitat sim step (rendering)
+             t2 = time.time()
+             iter_step += 1
+-            obs = env.step(action)
++            motion = action.get("motion") if args.waypoint_exec and action["action"] == 1 else None
++            if motion is not None:
++                waypoint_exec.set_motion(env.sim, motion["dx"], motion["dy"], motion["dyaw"])
++            obs = env.step({"action": action["action"]})
++            if motion is not None:
++                waypoint_exec.clear(env.sim)
++
++            if tracing:
++                pos_after = np.array(env.sim.get_agent_state().position, dtype=float)
++                names = ("STOP", "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT")
++                trace_steps.append({
++                    "step": iter_step - 1,
++                    "action": names[model_action] if 0 <= model_action < 4 else "NONE",
++                    "executed": names[action["action"]] if 0 <= action["action"] < 4 else str(action["action"]),
++                    "pos": [round(v, 3) for v in pos_before],
++                    # Agents rotate only about the vertical axis, so yaw is 2*atan2(y, w).
++                    "yaw_deg": round(math.degrees(2 * math.atan2(q.y, q.w)), 1),
++                    "dtg": round(float(info["distance_to_goal"]), 3),
++                    "moved": round(float(np.linalg.norm(pos_after - pos_before)), 3),
++                })
++                if schedule is not None:
++                    trace_steps[-1]["stage"] = stage
++                if k_script is not None:
++                    trace_steps[-1]["scripted"] = True
++                if getattr(agent, "last_head", None):
++                    trace_steps[-1]["head"] = agent.last_head
++                if s1 is not None:
++                    trace_steps[-1]["s1"] = {"query": s1_reason, "motion": [round(v, 4) for v in s1_motion] if s1_motion else None,
++                                             "scan_min": round(float(np.min(np.hypot(*scan_pts.T))), 3) if len(scan_pts) else None}
++                if steer_rec is not None:
++                    trace_steps[-1]["steer"] = steer_rec
++                if ptr is not None:
++                    trace_steps[-1]["ptr"] = ptr_k
++                    trace_steps[-1]["ptr_progress"] = round(ptr.progress, 3)
++                    if args.pointer_schedule is not None:
++                        trace_steps[-1]["shown"] = obs_text_shown
++                # The greedy geodesic follower's next action: what an oracle would
++                # do from this exact pose. Observed only; the policy never sees it.
++                if "shortest_path_sensor" in obs_before:
++                    trace_steps[-1]["oracle"] = names[int(obs_before["shortest_path_sensor"][0])]
++                # "action" and "executed" above keep their existing meaning, so
++                # every analysis script that reads these traces is unaffected.
++                _probe = getattr(agent, "last_probe", None)
++                if _probe is not None:
++                    trace_steps[-1]["probe"] = _probe
++            if args.dump_hidden:
++                hidden_rows.append(agent.last_hidden)
+             t3 = time.time()
+             render_elapsed = t3 - t2
+             total_render_time += render_elapsed
+@@ -164,14 +712,66 @@ def evaluate(config, split_id, dataset, args):
+         result_dict = {k: info[k] for k in target_key if k in info}
+         result_dict["id"] = env.current_episode.episode_id
+         result_dict["steps"] = iter_step
++        if s1 is not None:
++            result_dict["s2_queries"] = s1.queries
++        if hasattr(agent, "action_counts"):
++            # Exact per-action tallies. Under Ackermann, path_length no longer
++            # separates forward motion from turning, so turn fraction has to come
++            # from what was commanded rather than from distance travelled.
++            result_dict["actions"] = dict(agent.action_counts)
+         all_results.append(result_dict)
+ 
+         if "data" in args.exp_save:
+             log_dir = os.path.join(args.result_path, "log")
+             os.makedirs(log_dir, exist_ok=True)
++            # Written BEFORE stats_<id>.json: resumability keys off that file, so
++            # an episode must never be marked complete without its states.
++            if args.capture_dir:
++                cap = agent.flush_capture(env.current_episode.episode_id,
++                                          os.path.abspath(args.capture_dir))
++                result_dict["capture_bytes"] = cap["bytes"]
++                result_dict["capture_layout_issues"] = agent.capture_issues
++            if args.dump_hidden and hidden_rows:
++                hid_dir = os.path.join(args.result_path, "hidden")
++                os.makedirs(hid_dir, exist_ok=True)
++                np.save(os.path.join(hid_dir, f"{env.current_episode.episode_id}.npy"),
++                        np.stack(hidden_rows).astype(np.float16))
+             with open(os.path.join(log_dir, f"stats_{env.current_episode.episode_id}.json"), "w") as f:
+                 json.dump(result_dict, f, indent=4)
+ 
++        if tracing:
++            ep = env.current_episode
++            with open(os.path.join(trace_dir, f"{ep.episode_id}.json"), "w") as f:
++                json.dump({
++                    "episode_id": str(ep.episode_id),
++                    "scene": ep.scene_id.split("/")[-2],
++                    "instruction": ep.instruction.instruction_text,
++                    "instruction_schedule": schedule,
++                    "derail": derail_log,
++                    "steer": steer_log,
++                    "goal": list(ep.goals[0].position),
++                    "reference_path": [list(p) for p in ep.reference_path],
++                    "stop_by": stop_by,
++                    "start_position": list(ep.start_position),
++                    "start_rotation": list(ep.start_rotation),
++                    "final_pos": [round(float(v), 3) for v in env.sim.get_agent_state().position],
++                    "final": result_dict,
++                    "probe_config": ({"arms": probe_spec["arms"],
++                                      "min_step": probe_spec.get("min_step", 9),
++                                      "control_repeat_every":
++                                          probe_spec.get("control_repeat_every", 0)}
++                                     if probe_spec else None),
++                    "probe_instruction": (probe_spec["instruction_swap"].get(str(ep.episode_id))
++                                          if probe_spec else None),
++                    "pointer": ({"K": ptr.K, "ends_m": [round(x, 3) for x in ptr.ends],
++                                 "subinstructions": [ptr.prompt_from(j) for j in range(ptr.K)],
++                                 "shuffled": ptr.shuffled(shuffle_seed) if ptr.K >= 2 else None,
++                                 "schedule_shift": args.pointer_schedule,
++                                 "probe": bool(args.pointer_probe)}
++                                if ptr is not None else None),
++                    "steps": trace_steps,
++                }, f)
++
+     print(f"[chunk{split_id}] Done. Skipped {skipped} already-completed episodes, ran {len(all_results)} new episodes.")
+ 
+     # Load previously completed results and merge
+diff --git a/src/qwen_vl/model/modeling_qwen3_vl.py b/src/qwen_vl/model/modeling_qwen3_vl.py
+index 01c14bb..6b9a18a 100644
+--- a/src/qwen_vl/model/modeling_qwen3_vl.py
++++ b/src/qwen_vl/model/modeling_qwen3_vl.py
+@@ -96,13 +96,27 @@ class StartRecentKVCache:
+         seq_len = past_key_values[0][0].size(self.k_seq_dim)
+         if seq_len <= self.cache_size:
+             return past_key_values
+-        return [
+-            [
+-                torch.cat([self.k_slice(k, 0, self.start_size), self.k_slice(k, seq_len - self.recent_size, seq_len)], dim=self.k_seq_dim),
+-                torch.cat([self.v_slice(v, 0, self.start_size), self.v_slice(v, seq_len - self.recent_size, seq_len)], dim=self.v_seq_dim),
+-            ]
+-            for k, v in past_key_values
+-        ]
++        # Trim layer by layer, in place. The original list comprehension built
++        # every layer's new K/V before rebinding, so the whole old cache and the
++        # whole new cache were resident at once -- a transient of one extra full
++        # cache on the single step the trim first fires (~5 GB at 8+24 frames,
++        # ~8.9 GB at 8+48). Measured peak was 23.17 GB against ~23.5 GB usable on
++        # a 24 GB card: it OOM'd or squeaked through depending on what else held
++        # VRAM at that instant. Replacing each slot as its replacement is built
++        # drops the transient to one cache plus one layer.
++        for i in range(len(past_key_values)):
++            k, v = past_key_values[i]
++            new_k = torch.cat(
++                [self.k_slice(k, 0, self.start_size),
++                 self.k_slice(k, seq_len - self.recent_size, seq_len)], dim=self.k_seq_dim)
++            new_v = torch.cat(
++                [self.v_slice(v, 0, self.start_size),
++                 self.v_slice(v, seq_len - self.recent_size, seq_len)], dim=self.v_seq_dim)
++            past_key_values[i] = [new_k, new_v]
++            # Drop the last references to the old tensors so they free now rather
++            # than at the end of the loop.
++            del k, v, new_k, new_v
++        return past_key_values
+ 
+ 
+ # ============ FutureNav Model for Qwen3-VL (single-node) ============
+diff --git a/src/qwen_vl/model/modeling_qwen3_vl_obshead.py b/src/qwen_vl/model/modeling_qwen3_vl_obshead.py
+index 9d51ca2..94b323e 100644
+--- a/src/qwen_vl/model/modeling_qwen3_vl_obshead.py
++++ b/src/qwen_vl/model/modeling_qwen3_vl_obshead.py
+@@ -6,7 +6,7 @@ import torch.nn as nn
+ import torch.nn.functional as F
+ from typing import Any, Dict, List, Optional, Tuple, Union
+ from torch.nn import CrossEntropyLoss
+-from contextlib import nullcontext
++from contextlib import contextmanager, nullcontext
+ 
+ from transformers.utils import logging
+ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+@@ -46,9 +46,17 @@ class Qwen3VLForFutureNav(Qwen3VLForConditionalGenerationForFutureNav):
+         hidden_size = config.text_config.hidden_size
+         vggt_dim = 2048
+ 
++        # Dimensions below match the released FutureNav-4B-Base checkpoint, which
++        # disagrees with the widths this file originally declared: forward_head.0
++        # is LayerNorm(2560) and inverse_head.0 is LayerNorm(5120) on disk, not
++        # hidden*2 and hidden*4. With the original widths from_pretrained dies with
++        #   size mismatch for bias: copying a param with shape [2560] ...
++        #   the shape in current model is [5120]
++        # These heads are training-only and unused at inference; they exist so the
++        # checkpoint loads cleanly.
+         self.forward_head = nn.Sequential(
+-            nn.LayerNorm(hidden_size * 2),
+-            nn.Linear(hidden_size * 2, hidden_size),
++            nn.LayerNorm(hidden_size),
++            nn.Linear(hidden_size, hidden_size),
+             nn.GELU(),
+             nn.Linear(hidden_size, vggt_dim),
+         )
+@@ -61,8 +69,8 @@ class Qwen3VLForFutureNav(Qwen3VLForConditionalGenerationForFutureNav):
+         )
+ 
+         self.inverse_head = nn.Sequential(
+-            nn.LayerNorm(hidden_size * 4),
+-            nn.Linear(hidden_size * 4, hidden_size),
++            nn.LayerNorm(hidden_size * 2),
++            nn.Linear(hidden_size * 2, hidden_size),
+             nn.GELU(),
+             nn.Linear(hidden_size, 4),
+         )
+@@ -99,6 +107,36 @@ class Qwen3VLForFutureNav(Qwen3VLForConditionalGenerationForFutureNav):
+             tokens = tokenizer.encode(action_name, add_special_tokens=False)
+             self._action_token_map[tuple(tokens)] = action_id
+ 
++    # --- opt-in VGGT feature reuse (experiments/e1_1) ---------------------
++    # A class attribute, so every existing caller -- training, eval/agent.py,
++    # deploy/futurenav_core.py's normal path -- reads None at zero cost and
++    # this is a no-op. Nothing below runs unless a caller opts in.
++    _vggt_reuse = None
++
++    @contextmanager
++    def vggt_feature_reuse(self, capture: bool = False, inject=None):
++        """Capture or inject the merged, PRE-interpolate geometry tensor.
++
++        capture=True    -> after the prefill, reuse["tensor"] holds
++                           image_embeds_3d exactly as merger_vggt produced it:
++                           [391, hidden] for a 640x480 frame, BEFORE the
++                           F.interpolate to n_qwen.
++        inject=<tensor> -> the VGGT aggregator is not run at all, so
++                           past_key_values_vggt is untouched and the call adds
++                           NO frame to the spatial memory. images_vggt is never
++                           read.
++
++        Pre-interpolate is mandatory: F.interpolate below stretches 391 tokens
++        to n_qwen, and n_qwen is 300 * (number of Qwen images), which differs
++        between the early steps and the steady state.
++        """
++        prev = self._vggt_reuse
++        self._vggt_reuse = {"capture": capture, "inject": inject, "tensor": None}
++        try:
++            yield self._vggt_reuse
++        finally:
++            self._vggt_reuse = prev
++
+     def forward(
+         self,
+         input_ids: torch.LongTensor = None,
+@@ -125,6 +163,7 @@ class Qwen3VLForFutureNav(Qwen3VLForConditionalGenerationForFutureNav):
+         next_vggt_targets: Optional[List] = None,
+         next_frame_vggt: Optional[List] = None,
+         tag: str = None,
++        logits_to_keep: Union[int, torch.Tensor] = 0,
+         **kwargs,
+     ) -> Union[Tuple, Qwen3VLCausalLMOutputWithPast]:
+ 
+@@ -135,72 +174,87 @@ class Qwen3VLForFutureNav(Qwen3VLForConditionalGenerationForFutureNav):
+ 
+             if pixel_values is not None:
+                 batch_size = inputs_embeds.shape[0]
+-                image_embeds_3d = []
+-
+-                vggt_params = list(self.vggt.parameters())
+-                vggt_context = GatheredParameters(vggt_params, modifier_rank=None) if HAS_DEEPSPEED and any(hasattr(p, 'ds_id') for p in vggt_params) else nullcontext()
+-
+-                with vggt_context:
+-                    for i in range(batch_size):
+-                        if images_vggt[i].shape[0] > 0:
+-                            n_image = 1
+-                            height, width = images_vggt[i].shape[-2:]
+-                            vggt_patch_size = 14
+-                            merge_size = self.config.vision_config.spatial_merge_size
+-                            h_grid, w_grid = height // vggt_patch_size, width // vggt_patch_size
+-                            h_grid_after_merge = h_grid // merge_size
+-                            w_grid_after_merge = w_grid // merge_size
+-
+-                            all_frames = images_vggt[i]
+-                            n_original_frames = all_frames.shape[0]
+-
+-                            dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+-                            with torch.no_grad():
+-                                with torch.amp.autocast('cuda', dtype=dtype):
+-                                    if not self.config.reference_frame == "first":
+-                                        all_frames = torch.flip(all_frames, dims=(0,))
+-
+-                                    if self.mode == "evaluation":
+-                                        if self.past_key_values_vggt is None:
+-                                            self.past_key_values_vggt = [None] * self.vggt.aggregator.depth
+-                                    else:
+-                                        self.past_key_values_vggt = [None] * self.vggt.aggregator.depth
+-
+-                                    current_features = None
+-                                    for k, frame in enumerate(all_frames):
+-                                        images = frame.unsqueeze(0).unsqueeze(0)
+-                                        aggregator_output = self.vggt.aggregator(
+-                                            images,
+-                                            past_key_values=self.past_key_values_vggt,
+-                                            use_cache=True,
+-                                            past_frame_idx=k,
+-                                        )
+-
+-                                        if isinstance(aggregator_output, tuple) and len(aggregator_output) == 3:
+-                                            aggregated_tokens, patch_start_idx, past_key_values_vggt = aggregator_output
++                _reuse = self._vggt_reuse            # None unless opted in
++                _inject = _reuse["inject"] if _reuse is not None else None
++                if _inject is not None:
++                    # Skip the aggregator entirely. This is the point of the
++                    # whole mechanism: past_key_values_vggt is not touched, so
++                    # this call adds no frame to the spatial memory.
++                    image_embeds_3d = _inject.to(device=inputs_embeds.device,
++                                                 dtype=self.visual.dtype)
++                else:
++                    image_embeds_3d = []
++
++                    vggt_params = list(self.vggt.parameters())
++                    vggt_context = GatheredParameters(vggt_params, modifier_rank=None) if HAS_DEEPSPEED and any(hasattr(p, 'ds_id') for p in vggt_params) else nullcontext()
++
++                    with vggt_context:
++                        for i in range(batch_size):
++                            if images_vggt[i].shape[0] > 0:
++                                n_image = 1
++                                height, width = images_vggt[i].shape[-2:]
++                                vggt_patch_size = 14
++                                merge_size = self.config.vision_config.spatial_merge_size
++                                h_grid, w_grid = height // vggt_patch_size, width // vggt_patch_size
++                                h_grid_after_merge = h_grid // merge_size
++                                w_grid_after_merge = w_grid // merge_size
++
++                                all_frames = images_vggt[i]
++                                n_original_frames = all_frames.shape[0]
++
++                                dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
++                                with torch.no_grad():
++                                    with torch.amp.autocast('cuda', dtype=dtype):
++                                        if not self.config.reference_frame == "first":
++                                            all_frames = torch.flip(all_frames, dims=(0,))
++
++                                        if self.mode == "evaluation":
++                                            if self.past_key_values_vggt is None:
++                                                self.past_key_values_vggt = [None] * self.vggt.aggregator.depth
+                                         else:
+-                                            aggregated_tokens, patch_start_idx = aggregator_output
++                                            self.past_key_values_vggt = [None] * self.vggt.aggregator.depth
++
++                                        current_features = None
++                                        for k, frame in enumerate(all_frames):
++                                            images = frame.unsqueeze(0).unsqueeze(0)
++                                            aggregator_output = self.vggt.aggregator(
++                                                images,
++                                                past_key_values=self.past_key_values_vggt,
++                                                use_cache=True,
++                                                past_frame_idx=k,
++                                            )
++
++                                            if isinstance(aggregator_output, tuple) and len(aggregator_output) == 3:
++                                                aggregated_tokens, patch_start_idx, past_key_values_vggt = aggregator_output
++                                            else:
++                                                aggregated_tokens, patch_start_idx = aggregator_output
++
++                                            self.past_key_values_vggt = past_key_values_vggt
++                                            if self.mode == "evaluation" and self.past_key_values_vggt is not None:
++                                                self.past_key_values_vggt = self.kv_cache_vggt(self.past_key_values_vggt)
+ 
+-                                        self.past_key_values_vggt = past_key_values_vggt
+-                                        if self.mode == "evaluation" and self.past_key_values_vggt is not None:
+-                                            self.past_key_values_vggt = self.kv_cache_vggt(self.past_key_values_vggt)
++                                            feat = aggregated_tokens[-2][0, :, patch_start_idx:]
+ 
+-                                        feat = aggregated_tokens[-2][0, :, patch_start_idx:]
++                                            if k == n_original_frames - 1:
++                                                current_features = feat.clone()
+ 
+-                                        if k == n_original_frames - 1:
+-                                            current_features = feat.clone()
++                                features = current_features
++                                if not self.config.reference_frame == "first":
++                                    features = torch.flip(features, dims=(0,))
+ 
+-                            features = current_features
+-                            if not self.config.reference_frame == "first":
+-                                features = torch.flip(features, dims=(0,))
++                                features = features.view(n_image, h_grid, w_grid, -1)
++                                features = features[:, :h_grid_after_merge * merge_size, :w_grid_after_merge * merge_size, :].contiguous()
++                                features = features.view(n_image, h_grid_after_merge, merge_size, w_grid_after_merge, merge_size, -1)
++                                features = features.permute(0, 1, 3, 2, 4, 5).contiguous().to(self.visual.dtype)
++                                image_embeds_3d.append(self.merger_vggt(features))
+ 
+-                            features = features.view(n_image, h_grid, w_grid, -1)
+-                            features = features[:, :h_grid_after_merge * merge_size, :w_grid_after_merge * merge_size, :].contiguous()
+-                            features = features.view(n_image, h_grid_after_merge, merge_size, w_grid_after_merge, merge_size, -1)
+-                            features = features.permute(0, 1, 3, 2, 4, 5).contiguous().to(self.visual.dtype)
+-                            image_embeds_3d.append(self.merger_vggt(features))
++                    image_embeds_3d = torch.cat(image_embeds_3d, dim=0).to(self.visual.dtype)
+ 
+-                image_embeds_3d = torch.cat(image_embeds_3d, dim=0).to(self.visual.dtype)
++                    if _reuse is not None and _reuse["capture"]:
++                        # Captured here, structurally before the
++                        # F.interpolate below. A reference, not a clone:
++                        # nothing writes to this tensor in place.
++                        _reuse["tensor"] = image_embeds_3d
+ 
+                 pixel_values = pixel_values.type(self.visual.dtype)
+                 image_embeds, deepstack_image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+@@ -301,7 +355,16 @@ class Qwen3VLForFutureNav(Qwen3VLForConditionalGenerationForFutureNav):
+         )
+ 
+         hidden_states = outputs[0]
+-        logits = self.lm_head(hidden_states)
++        # Project only the positions whose logits are needed. Generation needs the
++        # last one; the original code ran lm_head over the whole sequence, which
++        # for a ~2800-token prompt allocates [1, 2800, 151936] bf16 = 811 MiB and
++        # throws almost all of it away -- every step. logits_to_keep=0 (the
++        # default, and what training uses since -0 == 0) keeps the full sequence
++        # so the loss branch below is unaffected. transformers passes
++        # logits_to_keep=1 automatically now that it appears in this signature
++        # (GenerationMixin._supports_logits_to_keep inspects it).
++        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
++        logits = self.lm_head(hidden_states[:, slice_indices, :])
+ 
+         loss = None
+         if labels is not None:

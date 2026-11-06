@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "method": "robust neutral-surface log-chromaticity field",
+  "basis": [
+    "1",
+    "x",
+    "y",
+    "r2",
+    "r4"
+  ],
+  "log_blue_over_green": [
+    0.014337753877043724,
+    0.03731949254870415,
+    0.004078990779817104,
+    0.09734898060560226,
+    -0.003639191621914506
+  ],
+  "log_red_over_green": [
+    -0.06792665272951126,
+    0.05831364169716835,
+    -0.012403341010212898,
+    0.33957865834236145,
+    -0.06876099109649658
+  ],
+  "width": 640,
+  "height": 420,
+  "neutral_cells": 1589,
+  "median_abs_fit_log_error": [
+    0.03514392673969269,
+    0.04384037107229233
+  ],
+  "source_images": [
+    {
+      "path": "calib/jetracer_audit/20261020T124752Z_bot1_19f056_00000.jpg",
+      "sha256": "517006b089857d3c863e2c59f5affba7ab39c200d680558085cd7683f75fa016"
+    },
+    {
+      "path": "calib/jetracer_audit/20261020T124752Z_bot1_19f056_00324.jpg",
+      "sha256": "164005e03e900c129d62d41e4c813ad37c7142c54248cfca2c1e6a1ea359bf10"
+    },
+    {
+      "path": "calib/jetracer_audit/20261020T124752Z_bot1_19f056_00648.jpg",
+      "sha256": "91ffb34737be3992dd3916d57153a2b6cabea3e8babbffcca16fe4f47a5631b3"
+    },
+    {
+      "path": "calib/jetracer_audit/20261020T124752Z_bot1_19f056_00972.jpg",
+      "sha256": "e537d315e03a3343805107084c767eb029ed65010c156c5a22bbe8330c649789"
+    },
+    {
+      "path": "calib/jetracer_audit/20261020T125821Z_bot1_d0067e_00000.jpg",
+      "sha256": "9230b4cf0f16a7228cb48529a53f065605a809af5543d49f7b8d07abfa6c17b9"
+    },
+    {
+      "path": "calib/jetracer_audit/20261020T125821Z_bot1_d0067e_00571.jpg",
+      "sha256": "9cf1834daf30f63947cce83897479f4296d35ef2a71ff8d7848b62a9510a145f"
+    },
+    {
+      "path": "calib/jetracer_audit/20261020T125821Z_bot1_d0067e_01143.jpg",
+      "sha256": "3c37a81269860c476c2300c71902f59978b5f3502cc089358326696555391c84"
+    },
+    {
+      "path": "calib/jetracer_audit/20261020T125821Z_bot1_d0067e_01715.jpg",
+      "sha256": "97eb755359ff18c40a84570f98d63a09f3de306cbbd1714c496d86eb8a0a2274"
+    }
+  ],
+  "limitation": "Estimated from assumed neutral room surfaces; no color chart or spectral response measurement."
+}

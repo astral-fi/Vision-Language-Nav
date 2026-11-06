@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Data, weights and run outputs never go in git
+data/
+outputs/
+out/
+runs/
+logs/
+pretrain_models/
+checkpoints/
+*.safetensors
+*.pth
+*.ckpt
+*.npz
+*.mp4
+calib/jetracer_audit/
+.inference-run.lock
+.DS_Store

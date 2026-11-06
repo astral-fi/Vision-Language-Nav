@@ -1,0 +1,39 @@
+{
+  "K": [
+    [
+      421.904734,
+      0.0,
+      332.70997850971054
+    ],
+    [
+      0.0,
+      458.671242,
+      215.9795989524396
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "D": [
+    0.10177797722113131,
+    0.2444966006243762,
+    -1.5171248575977263,
+    1.3931796483131422
+  ],
+  "width": 640,
+  "height": 420,
+  "distortion_model": "opencv_fisheye",
+  "virtual_hfov_deg": 64.5,
+  "target_size": [
+    640,
+    480
+  ],
+  "valid_source_fraction": 0.99625,
+  "method": "targetless architectural-edge straightness with CameraInfo intrinsic prior",
+  "validation_report": "jetracer_targetless_validation.json",
+  "raw_edge_rms_px": 0.503980744382599,
+  "validation_edge_rms_px": 0.4457779190010583,
+  "limitation": "Focal lengths anchored to live CameraInfo; distortion center and first two radial coefficients refined. Higher-order coefficients retain the prior model representation."
+}
